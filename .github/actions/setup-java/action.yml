@@ -1,0 +1,20 @@
+name: 'Setup Java & Maven cache'
+description: 'Install Java 17, restore Maven dependency cache'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Java 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'maven'
+
+    - name: Restore Maven cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-maven-

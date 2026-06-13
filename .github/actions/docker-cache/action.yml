@@ -1,0 +1,22 @@
+name: 'Docker layer cache'
+description: 'Cache Docker build layers for faster builds. Adapted from Ember docker-cache action.'
+
+inputs:
+  service:
+    description: 'Service name e.g. alert-engine'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Cache Docker layers
+      uses: actions/cache@v4
+      with:
+        path: /tmp/.buildx-cache-${{ inputs.service }}
+        key: ${{ runner.os }}-buildx-${{ inputs.service }}-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-buildx-${{ inputs.service }}-
+          ${{ runner.os }}-buildx-

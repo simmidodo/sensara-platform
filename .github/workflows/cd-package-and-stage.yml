@@ -1,0 +1,180 @@
+name: CD — Package & Stage to Staging
+# Adapted from Ember cd-package-and-stage-code.yml
+# Runs after CI gate passes on merge to main
+# Pushes SHA-pinned images to Artifact Registry and deploys to staging namespace
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # required for GCP Workload Identity Federation
+
+jobs:
+  guard:
+    name: Guard — CI must have passed
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - run: echo "CI passed — proceeding to package and stage"
+
+  build-and-push:
+    name: Build & push (${{ matrix.service }})
+    needs: guard
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service:
+          - alert-engine
+          - sensaraconnect
+          - monitoring-svc
+          - notification-svc
+          - api-gateway
+    outputs:
+      image_tag: ${{ steps.set-tag.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag (SHA-pinned — never :latest)
+        id: set-tag
+        run: echo "image_tag=sha-${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Authenticate to GCP (Workload Identity)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker europe-west4-docker.pkg.dev --quiet
+
+      - name: Load Docker cache
+        uses: ./.github/actions/docker-cache
+        with:
+          service: ${{ matrix.service }}
+
+      - name: Build image
+        run: |
+          IMAGE_BASE="europe-west4-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/sensara/${{ matrix.service }}"
+          docker build \
+            --cache-from ${IMAGE_BASE}:cache \
+            --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --build-arg GIT_SHA=${{ github.sha }} \
+            -t ${IMAGE_BASE}:${{ steps.set-tag.outputs.image_tag }} \
+            -t ${IMAGE_BASE}:cache \
+            -f services/${{ matrix.service }}/Dockerfile \
+            services/${{ matrix.service }}
+
+      - name: Push image and cache layer
+        run: |
+          IMAGE_BASE="europe-west4-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/sensara/${{ matrix.service }}"
+          docker push ${IMAGE_BASE}:${{ steps.set-tag.outputs.image_tag }}
+          docker push ${IMAGE_BASE}:cache
+
+      - name: Scan image for vulnerabilities
+        run: |
+          gcloud artifacts docker images scan \
+            europe-west4-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/sensara/${{ matrix.service }}:${{ steps.set-tag.outputs.image_tag }} \
+            --format='value(response.scan)' \
+            --location=europe-west4
+
+  deploy-staging:
+    name: Deploy to staging namespace
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: sensara-prod
+          location: europe-west4
+
+      - name: Run Flyway migration (init container pattern)
+        run: |
+          # Run migration Job BEFORE any pods are updated
+          # If this fails, no pods are touched — old pods stay live
+          cat k8s/base/flyway-migration-job.yaml | \
+            sed "s|IMAGE_TAG|sha-${{ github.sha }}|g" | \
+            kubectl apply -n staging -f -
+
+          # Wait for migration to complete
+          kubectl wait --for=condition=complete \
+            --timeout=300s \
+            job/flyway-migrate \
+            -n staging
+
+          echo "✅ Migration complete — safe to deploy pods"
+
+      - name: Update image tags in staging overlay
+        run: |
+          cd k8s/overlays/staging
+          # Update each service image tag — SHA-pinned
+          for service in alert-engine sensaraconnect monitoring-svc notification-svc api-gateway; do
+            sed -i "s|${service}:.*|${service}:sha-${{ github.sha }}|g" kustomization.yaml
+          done
+
+      - name: Apply staging manifests via kubectl
+        run: |
+          kubectl apply -k k8s/overlays/staging
+          kubectl rollout status deployment/alert-engine -n staging --timeout=180s
+          kubectl rollout status deployment/sensaraconnect -n staging --timeout=180s
+
+      - name: Record staging deployment
+        uses: ./.github/actions/record-deployment
+        with:
+          app: all-services
+          env: staging
+          stage: live
+          version: sha-${{ github.sha }}
+          gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+
+  smoke-tests:
+    name: Smoke tests (staging)
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-java
+
+      - name: Run smoke tests against staging
+        env:
+          SMOKE_TEST_BASE_URL: ${{ vars.STAGING_BASE_URL }}
+          SMOKE_TEST_API_KEY: ${{ secrets.STAGING_SMOKE_API_KEY }}
+        run: |
+          mvn --batch-mode test \
+            -Dspring.profiles.active=smoke-test \
+            -Dsmoke.baseUrl=${SMOKE_TEST_BASE_URL} \
+            -P smoke-tests
+
+      - name: Check Pub/Sub subscriber lag
+        run: |
+          # Lag must be 0 for 5 consecutive minutes before promoting
+          ./scripts/check-pubsub-lag.sh staging 5
+
+      - name: Generate staging summary
+        run: |
+          echo "## 🚀 Staging deployment ready" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| SHA | \`sha-${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployed by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Smoke tests | ✅ passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pub/Sub lag | ✅ zero |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next step:** Run the [Production Deploy workflow](../actions/workflows/cd-production-deploy.yml)" >> $GITHUB_STEP_SUMMARY
+          echo "Select: *Deploy to prod-green (standby)* then *Flip traffic to prod-green*" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,71 @@
+# Flyway migration — runs as a Kubernetes Job BEFORE any application pods start
+# This is the fix for crash reason #3: Flyway running inside pod on startup
+# If this Job fails → kubectl wait times out → no pods are replaced → old pods stay live
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flyway-migrate
+  # namespace: injected at deploy time (staging | prod-blue | prod-green)
+  labels:
+    app: flyway-migrate
+    sensara.eu/version: IMAGE_TAG    # replaced by deploy script
+spec:
+  # Job must complete within 5 minutes or it fails
+  # Prevents a bad migration from blocking the pipeline forever
+  activeDeadlineSeconds: 300
+  backoffLimit: 0   # no retries — if migration fails, fail fast
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: sensara-migration-ksa
+
+      # Migration runs as non-root for ISO 27001 compliance
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: flyway-migrate
+          image: europe-west4-docker.pkg.dev/PROJECT_ID/sensara/flyway-migrations:IMAGE_TAG
+          imagePullPolicy: Always
+
+          args:
+            - migrate
+            - -url=jdbc:postgresql://$(DB_HOST):5432/$(DB_NAME)
+            - -user=$(DB_USER)
+            - -password=$(DB_PASSWORD)
+            - -locations=classpath:db/migration
+            - -outOfOrder=false
+            - -validateOnMigrate=true
+
+          env:
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: host
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: database
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: password
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

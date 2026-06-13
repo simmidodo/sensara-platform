@@ -1,0 +1,96 @@
+# Adapted from Ember .github/actions/record-deployment/action.yml
+# Translated: AWS SSM Parameter Store → GCP Firestore
+# Pattern identical: save backout version FIRST, then update current
+
+name: 'Record deployment'
+description: 'Record deployment version to Firestore. Saves backout version before updating current.'
+
+inputs:
+  app:
+    description: 'Application name e.g. alert-engine, sensaraconnect, all-services'
+    required: true
+  env:
+    description: 'Environment: staging, production'
+    required: true
+  stage:
+    description: 'Stage: live, standby'
+    required: true
+  version:
+    description: 'Version SHA being deployed e.g. sha-abc123'
+    required: true
+  slot:
+    description: 'GKE namespace slot: prod-blue or prod-green'
+    required: false
+    default: ''
+  gcp_project_id:
+    description: 'GCP project ID'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set Firestore document paths
+      id: paths
+      shell: bash
+      run: |
+        # Same hierarchy as Ember SSM paths:
+        # /deployedVersions/{app}/{account}/{region}/{env}/{stage}
+        # → Firestore: sensara-deployments/{env}-{stage}
+        DOC_PATH="projects/${{ inputs.gcp_project_id }}/databases/default/documents/sensara-deployments/${{ inputs.env }}-${{ inputs.stage }}"
+        BACKOUT_PATH="projects/${{ inputs.gcp_project_id }}/databases/default/documents/sensara-deployments/${{ inputs.env }}-backout"
+        echo "doc_path=$DOC_PATH" >> $GITHUB_OUTPUT
+        echo "backout_path=$BACKOUT_PATH" >> $GITHUB_OUTPUT
+
+    - name: Save backout version (before updating current)
+      shell: bash
+      run: |
+        # Adapted from Ember: "Save back out version" step
+        # Always save the CURRENT version as backout BEFORE updating
+        BACKOUT_PATH="${{ steps.paths.outputs.backout_path }}"
+        CURRENT=$(gcloud firestore documents get \
+          ${{ steps.paths.outputs.doc_path }} \
+          --format='value(fields.version.stringValue)' 2>/dev/null || echo "")
+
+        if [ -n "$CURRENT" ]; then
+          echo "Saving backout version: $CURRENT"
+          gcloud firestore documents patch "$BACKOUT_PATH" \
+            --data='{
+              "version": "'"$CURRENT"'",
+              "slot": "'"${{ inputs.slot }}"'",
+              "savedAt": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
+            }' || \
+          gcloud firestore documents create "$BACKOUT_PATH" \
+            --data='{
+              "version": "'"$CURRENT"'",
+              "slot": "'"${{ inputs.slot }}"'",
+              "savedAt": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
+            }'
+        else
+          echo "No current version found — first deployment, skipping backout save"
+        fi
+
+    - name: Update deployment record
+      shell: bash
+      run: |
+        # Adapted from Ember: "Update deployment data" step
+        DEPLOY_DATE=$(TZ='Europe/Amsterdam' date '+%a, %d %b %Y %H:%M:%S')
+        DOC_PATH="${{ steps.paths.outputs.doc_path }}"
+
+        DEPLOYMENT_DATA='{
+          "deployer": "'"${{ github.actor }}"'",
+          "event": "'"${{ github.event_name }}"'",
+          "triggered_by": "'"${{ github.workflow }}"'",
+          "actions_run_link": "'"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"'",
+          "deploy_date": "'"$DEPLOY_DATE"'",
+          "version": "'"${{ inputs.version }}"'",
+          "slot": "'"${{ inputs.slot }}"'",
+          "app": "'"${{ inputs.app }}"'"
+        }'
+
+        echo "Recording deployment to Firestore: $DOC_PATH"
+        gcloud firestore documents patch "$DOC_PATH" \
+          --data="$DEPLOYMENT_DATA" 2>/dev/null || \
+        gcloud firestore documents create "$DOC_PATH" \
+          --data="$DEPLOYMENT_DATA"
+
+        echo "✅ Deployment recorded"

@@ -1,0 +1,293 @@
+name: Production Deployment Assistant
+# Adapted from Ember cd-production-deploy.yml (Phoenix Group)
+# Translated: AWS SSM → GCP Firestore | ECS/Lambda → GKE namespace | ALB → Cloud Load Balancer
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Service to deploy'
+        required: true
+        type: choice
+        options:
+          - all-services
+          - alert-engine
+          - sensaraconnect
+          - monitoring-svc
+          - notification-svc
+      action:
+        description: 'Production action'
+        required: true
+        type: choice
+        options:
+          - 'Deploy to prod-green (standby — no traffic)'
+          - 'Flip traffic to prod-green (make live)'
+          - 'Rollback to prod-blue (backout)'
+
+run-name: '${{ inputs.service }}: ${{ inputs.action }}'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # ── DETERMINE VERSION ───────────────────────────────────────────────────
+  determine-version:
+    name: Determine version & validate
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      active_slot: ${{ steps.get-slot.outputs.active_slot }}
+      standby_slot: ${{ steps.get-slot.outputs.standby_slot }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get current version and active slot
+        id: get-version
+        run: |
+          if [[ "${{ inputs.action }}" == "Deploy to prod-green (standby — no traffic)" ]]; then
+            # Deploy staging version to standby slot
+            VERSION=$(gcloud firestore documents get \
+              projects/${{ vars.GCP_PROJECT_ID }}/databases/default/documents/sensara-deployments/staging \
+              --format='value(fields.version.stringValue)')
+
+          elif [[ "${{ inputs.action }}" == "Flip traffic to prod-green (make live)" ]]; then
+            # Version is whatever is in the standby slot
+            VERSION=$(gcloud firestore documents get \
+              projects/${{ vars.GCP_PROJECT_ID }}/databases/default/documents/sensara-deployments/prod-green \
+              --format='value(fields.version.stringValue)')
+
+          elif [[ "${{ inputs.action }}" == "Rollback to prod-blue (backout)" ]]; then
+            # Adapted from Ember /backoutVersions SSM path
+            VERSION=$(gcloud firestore documents get \
+              projects/${{ vars.GCP_PROJECT_ID }}/databases/default/documents/sensara-deployments/prod-backout \
+              --format='value(fields.version.stringValue)')
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Resolved version: $VERSION"
+
+      - name: Determine active/standby slots
+        id: get-slot
+        run: |
+          # Read which slot is currently live from Firestore
+          ACTIVE=$(gcloud firestore documents get \
+            projects/${{ vars.GCP_PROJECT_ID }}/databases/default/documents/sensara-deployments/active-slot \
+            --format='value(fields.slot.stringValue)' 2>/dev/null || echo "prod-blue")
+
+          if [[ "$ACTIVE" == "prod-blue" ]]; then
+            echo "active_slot=prod-blue" >> $GITHUB_OUTPUT
+            echo "standby_slot=prod-green" >> $GITHUB_OUTPUT
+          else
+            echo "active_slot=prod-green" >> $GITHUB_OUTPUT
+            echo "standby_slot=prod-blue" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Active slot: $ACTIVE"
+
+      - name: Generate action summary
+        run: |
+          echo "## Summary of action" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | ${{ inputs.service }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Action | ${{ inputs.action }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | \`${{ steps.get-version.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Active slot | ${{ steps.get-slot.outputs.active_slot }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Standby slot | ${{ steps.get-slot.outputs.standby_slot }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+
+  # ── DEPLOY TO STANDBY SLOT (no traffic impact) ─────────────────────────
+  deploy-to-standby:
+    name: Deploy to standby slot
+    needs: determine-version
+    if: inputs.action == 'Deploy to prod-green (standby — no traffic)'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: sensara-prod
+          location: europe-west4
+
+      - name: Run Flyway migration on standby namespace
+        run: |
+          STANDBY="${{ needs.determine-version.outputs.standby_slot }}"
+          VERSION="${{ needs.determine-version.outputs.version }}"
+
+          echo "Running Flyway migration in namespace: $STANDBY"
+          # Migration runs BEFORE pods — if this fails, active slot is untouched
+          cat k8s/base/flyway-migration-job.yaml | \
+            sed "s|IMAGE_TAG|${VERSION}|g" | \
+            sed "s|NAMESPACE|${STANDBY}|g" | \
+            kubectl apply -n ${STANDBY} -f -
+
+          kubectl wait --for=condition=complete \
+            --timeout=300s \
+            job/flyway-migrate \
+            -n ${STANDBY}
+
+          echo "✅ Migration complete in $STANDBY"
+
+      - name: Deploy to standby namespace
+        run: |
+          STANDBY="${{ needs.determine-version.outputs.standby_slot }}"
+          VERSION="${{ needs.determine-version.outputs.version }}"
+
+          cd k8s/overlays/${STANDBY}
+          for service in alert-engine sensaraconnect monitoring-svc notification-svc api-gateway; do
+            sed -i "s|${service}:.*|${service}:${VERSION}|g" kustomization.yaml
+          done
+
+          kubectl apply -k k8s/overlays/${STANDBY}
+
+          # Wait for all rollouts in standby — active slot still serving traffic
+          kubectl rollout status deployment/alert-engine -n ${STANDBY} --timeout=300s
+          kubectl rollout status deployment/sensaraconnect -n ${STANDBY} --timeout=300s
+          kubectl rollout status deployment/monitoring-svc -n ${STANDBY} --timeout=300s
+
+      - name: Record standby deployment
+        uses: ./.github/actions/record-deployment
+        with:
+          app: ${{ inputs.service }}
+          env: production
+          stage: standby
+          version: ${{ needs.determine-version.outputs.version }}
+          slot: ${{ needs.determine-version.outputs.standby_slot }}
+          gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Standby ready — await go/no-go
+        run: |
+          echo "## ✅ Standby slot ready" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**${{ needs.determine-version.outputs.standby_slot }}** is running \`${{ needs.determine-version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Active slot (${{ needs.determine-version.outputs.active_slot }}) is still serving 100% of traffic.**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Verify standby is healthy, then run:" >> $GITHUB_STEP_SUMMARY
+          echo "**Action:** *Flip traffic to prod-green (make live)*" >> $GITHUB_STEP_SUMMARY
+
+  # ── FLIP TRAFFIC (make standby live) ────────────────────────────────────
+  flip-traffic:
+    name: Flip Cloud LB traffic to standby slot
+    needs: determine-version
+    if: inputs.action == 'Flip traffic to prod-green (make live)'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Save backout version before flipping
+        # Adapted from Ember record-deployment action — save backout version FIRST
+        run: |
+          ACTIVE="${{ needs.determine-version.outputs.active_slot }}"
+
+          CURRENT_VERSION=$(gcloud firestore documents get \
+            projects/${{ vars.GCP_PROJECT_ID }}/databases/default/documents/sensara-deployments/${ACTIVE} \
+            --format='value(fields.version.stringValue)' 2>/dev/null || echo "")
+
+          if [ -n "$CURRENT_VERSION" ]; then
+            echo "Saving backout version: $CURRENT_VERSION"
+            # Same pattern as Ember /backoutVersions SSM path
+            gcloud firestore documents patch \
+              projects/${{ vars.GCP_PROJECT_ID }}/databases/default/documents/sensara-deployments/prod-backout \
+              --data='{"version": "'"$CURRENT_VERSION"'", "slot": "'"$ACTIVE"'", "savedAt": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}'
+          fi
+
+      - name: Flip Cloud Load Balancer backend
+        run: |
+          STANDBY="${{ needs.determine-version.outputs.standby_slot }}"
+          ./scripts/flip-traffic.sh ${STANDBY}
+
+      - name: Record new active slot
+        run: |
+          STANDBY="${{ needs.determine-version.outputs.standby_slot }}"
+          gcloud firestore documents patch \
+            projects/${{ vars.GCP_PROJECT_ID }}/databases/default/documents/sensara-deployments/active-slot \
+            --data='{"slot": "'"$STANDBY"'"}'
+
+      - name: Record production live deployment
+        uses: ./.github/actions/record-deployment
+        with:
+          app: ${{ inputs.service }}
+          env: production
+          stage: live
+          version: ${{ needs.determine-version.outputs.version }}
+          slot: ${{ needs.determine-version.outputs.standby_slot }}
+          gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Post-flip smoke test (60 second window)
+        run: |
+          sleep 10
+          mvn --batch-mode test \
+            -Dspring.profiles.active=smoke-test \
+            -Dsmoke.baseUrl=${{ vars.PROD_BASE_URL }} \
+            -P smoke-tests || {
+              echo "❌ Smoke tests failed — running automatic rollback"
+              ./scripts/flip-traffic.sh ${{ needs.determine-version.outputs.active_slot }}
+              exit 1
+            }
+
+      - name: Deployment live summary
+        run: |
+          echo "## 🚀 Production live" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| Live slot | ${{ needs.determine-version.outputs.standby_slot }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | \`${{ needs.determine-version.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Smoke tests | ✅ passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Backout available | ✅ one click |" >> $GITHUB_STEP_SUMMARY
+
+  # ── ROLLBACK (backout — adapted from Ember backout pattern) ─────────────
+  rollback:
+    name: Rollback to previous slot
+    needs: determine-version
+    if: inputs.action == 'Rollback to prod-blue (backout)'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Flip traffic to previous active slot
+        run: |
+          # Backout version slot is stored in Firestore (same as Ember SSM backout)
+          BACKOUT_SLOT=$(gcloud firestore documents get \
+            projects/${{ vars.GCP_PROJECT_ID }}/databases/default/documents/sensara-deployments/prod-backout \
+            --format='value(fields.slot.stringValue)')
+
+          echo "Rolling back to slot: $BACKOUT_SLOT"
+          ./scripts/flip-traffic.sh ${BACKOUT_SLOT}
+
+          echo "## ✅ Rollback complete" >> $GITHUB_STEP_SUMMARY
+          echo "Traffic flipped to: **${BACKOUT_SLOT}**" >> $GITHUB_STEP_SUMMARY
+          echo "Version: \`${{ needs.determine-version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "MTTR: under 60 seconds" >> $GITHUB_STEP_SUMMARY

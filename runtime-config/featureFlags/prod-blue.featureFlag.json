@@ -1,0 +1,10 @@
+{
+  "feature": {
+    "new_alert_engine": false,
+    "new_alert_engine_tenants": "futura-zorg",
+    "enable_ons_integration": true,
+    "sensaraconnect_v2": false,
+    "b2c_consumer_flow": false,
+    "resilience4j_circuit_breaker": true
+  }
+}

@@ -1,0 +1,143 @@
+# Base deployment — alert-engine (Spring Boot)
+# SHA-pinned image — no :latest ever
+# Feature flags read from ConfigMap volume (no redeploy needed to flip flags)
+# Liveness and readiness probes prevent traffic to unhealthy pods
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-engine
+  labels:
+    app: alert-engine
+    sensara.eu/tier: core
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5    # required for kubectl rollout undo to work
+  selector:
+    matchLabels:
+      app: alert-engine
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0      # never kill old pods before new ones are ready
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: alert-engine
+    spec:
+      serviceAccountName: sensara-workload-ksa
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+
+      containers:
+        - name: alert-engine
+          # Image tag replaced by deploy script — never :latest
+          image: europe-west4-docker.pkg.dev/PROJECT_ID/sensara/alert-engine:IMAGE_TAG
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+
+          # Feature flags mounted from ConfigMap as volume
+          # Spring Boot reads on each evaluation — no pod restart needed to flip a flag
+          volumeMounts:
+            - name: feature-flags
+              mountPath: /config/feature-flags
+              readOnly: true
+
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "kubernetes"
+            - name: SPRING_CONFIG_ADDITIONAL_LOCATION
+              value: "file:/config/feature-flags/"
+            # DB credentials from Secret Manager via Workload Identity
+            - name: SPRING_DATASOURCE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: url
+            - name: SPRING_DATASOURCE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: username
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: password
+            # Pub/Sub project
+            - name: SPRING_CLOUD_GCP_PROJECT_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace   # namespace = environment
+
+          # Flyway is DISABLED in the application — it runs as a Job before pods start
+          # This is the fix for the crash-on-startup migration bug
+          - name: SPRING_FLYWAY_ENABLED
+            value: "false"
+
+          # Readiness: pod only receives traffic when Spring Boot is fully up
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Liveness: restart pod if it becomes unresponsive
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+
+      volumes:
+        - name: feature-flags
+          configMap:
+            name: feature-flags   # deployed by cd-feature-flags.yml
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alert-engine
+spec:
+  selector:
+    app: alert-engine
+  ports:
+    - port: 80
+      targetPort: 8080
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: alert-engine-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: alert-engine
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

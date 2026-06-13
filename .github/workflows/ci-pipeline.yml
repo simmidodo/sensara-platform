@@ -1,0 +1,222 @@
+name: CI Pipeline
+# Adapted from Ember ci-pipeline.yml (Phoenix Group)
+# Translated: pnpm/Node → Maven/Java | AWS → GCP | Turbo cache → Maven cache
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── 1. COMPILE & VALIDATE ────────────────────────────────────────────────
+  compile:
+    name: Compile & validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-java
+
+      - name: Maven compile (all modules)
+        run: mvn --batch-mode compile -T4
+
+      - name: Validate POM structure
+        run: mvn --batch-mode validate
+
+  # ── 2. UNIT TESTS ────────────────────────────────────────────────────────
+  unit-test:
+    name: Unit tests
+    needs: compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-java
+
+      - name: Run unit tests
+        run: |
+          mvn --batch-mode test \
+            -Dspring.profiles.active=test \
+            -Dmaven.test.failure.ignore=false
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-reports
+          path: '**/target/surefire-reports/'
+          retention-days: 7
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: '**/target/site/jacoco/'
+          retention-days: 7
+
+  # ── 3. CODE QUALITY ───────────────────────────────────────────────────────
+  code-quality:
+    name: Code quality
+    needs: compile
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        check:
+          - checkstyle
+          - spotbugs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-java
+
+      - name: Run ${{ matrix.check }}
+        run: mvn --batch-mode ${{ matrix.check }}:check
+
+  # ── 4. DOCKER BUILD ──────────────────────────────────────────────────────
+  docker-build:
+    name: Docker build (${{ matrix.service }})
+    needs: compile
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service:
+          - alert-engine
+          - sensaraconnect
+          - monitoring-svc
+          - notification-svc
+          - api-gateway
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load and cache Docker layers
+        uses: ./.github/actions/docker-cache
+        with:
+          service: ${{ matrix.service }}
+
+      - name: Build Docker image (no push on PR)
+        run: |
+          IMAGE_TAG="sha-${{ github.sha }}"
+          docker build \
+            --cache-from europe-west4-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/sensara/${{ matrix.service }}:cache \
+            --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --build-arg GIT_SHA=${{ github.sha }} \
+            -t europe-west4-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/sensara/${{ matrix.service }}:${IMAGE_TAG} \
+            -f services/${{ matrix.service }}/Dockerfile \
+            services/${{ matrix.service }}
+
+  # ── 5. INTEGRATION TESTS ─────────────────────────────────────────────────
+  # Adapted from Ember integration-test job (mock servers → Cloud SQL proxy)
+  integration-test:
+    name: Integration tests
+    needs: compile
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: sensara_test
+          POSTGRES_USER: sensara
+          POSTGRES_PASSWORD: testpassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/sensara_test
+      SPRING_DATASOURCE_USERNAME: sensara
+      SPRING_DATASOURCE_PASSWORD: testpassword
+      SPRING_PROFILES_ACTIVE: integration-test
+      # Mock Pub/Sub — no real GCP credentials needed
+      PUBSUB_EMULATOR_HOST: localhost:8085
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-java
+
+      - name: Start Pub/Sub emulator
+        run: |
+          docker run -d \
+            --name pubsub-emulator \
+            -p 8085:8085 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
+            gcloud beta emulators pubsub start --host-port=0.0.0.0:8085
+
+      - name: Wait for emulator
+        run: |
+          echo "Waiting for Pub/Sub emulator..."
+          timeout 30 bash -c 'until curl -sf http://localhost:8085; do sleep 1; done'
+
+      - name: Run integration tests
+        run: |
+          mvn --batch-mode verify \
+            -Dspring.profiles.active=integration-test \
+            -Dmaven.test.failure.ignore=false \
+            -P integration-tests
+
+      - name: Upload integration test reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-reports
+          path: '**/target/failsafe-reports/'
+          retention-days: 7
+
+  # ── 6. SECURITY SCAN ─────────────────────────────────────────────────────
+  security-scan:
+    name: Security scan
+    needs: compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-java
+
+      - name: OWASP dependency check
+        run: |
+          mvn --batch-mode org.owasp:dependency-check-maven:check \
+            -DfailBuildOnCVSS=7 \
+            -DsuppressionFile=owasp-suppressions.xml
+
+      - name: Upload OWASP report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: owasp-report
+          path: target/dependency-check-report.html
+          retention-days: 14
+
+  # ── 7. GATE: ALL CHECKS PASS ─────────────────────────────────────────────
+  ci-gate:
+    name: CI gate (all checks pass)
+    needs:
+      - unit-test
+      - code-quality
+      - docker-build
+      - integration-test
+      - security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: All checks passed
+        run: |
+          echo "## ✅ CI Gate Passed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit tests | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Code quality | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Docker build | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration tests | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security scan | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "SHA: \`${{ github.sha }}\` is safe to promote to staging." >> $GITHUB_STEP_SUMMARY

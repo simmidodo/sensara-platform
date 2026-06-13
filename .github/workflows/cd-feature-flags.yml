@@ -1,0 +1,150 @@
+name: 'Feature Flags — Deploy to Kubernetes ConfigMap'
+# Adapted from Ember cd-version-feature-flags.yml
+# Translated: AWS AppConfig → Kubernetes ConfigMap mounted as volume
+# Change a JSON file → auto-detect → kubectl apply to correct namespace
+
+permissions:
+  contents: write
+  id-token: write
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'runtime-config/featureFlags/*.featureFlag.json'
+      - '!runtime-config/featureFlags/mock.featureFlag.json'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy flags to'
+        type: choice
+        default: 'all'
+        options:
+          - all
+          - staging
+          - prod-blue
+          - prod-green
+
+jobs:
+  detect-changes:
+    name: Detect changed flag files
+    runs-on: ubuntu-latest
+    outputs:
+      namespaces: ${{ steps.check-changes.outputs.namespaces }}
+      deploy_flags: ${{ steps.check-changes.outputs.deploy_flags }}
+      flag_version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Version the flag change
+        id: version
+        run: |
+          VERSION="flags-$(date -u +%Y%m%d%H%M)-${GITHUB_SHA::8}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Flag version: $VERSION"
+
+      - name: Detect which flag files changed
+        id: check-changes
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            INPUT="${{ inputs.environment }}"
+            if [ "$INPUT" = "all" ]; then
+              namespaces='["staging","prod-blue","prod-green"]'
+            else
+              namespaces='["'"$INPUT"'"]'
+            fi
+            echo "namespaces=$namespaces" >> $GITHUB_OUTPUT
+            echo "deploy_flags=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          BASE_COMMIT=${{ github.event.before }}
+          changed_files=$(git diff --name-only $BASE_COMMIT ${{ github.sha }} \
+            | grep 'runtime-config/featureFlags' || true)
+
+          namespaces=()
+          for file in $changed_files; do
+            filename=$(basename "$file")
+            if [[ $filename == *.featureFlag.json ]]; then
+              ns=$(echo "$filename" | cut -d '.' -f 1)
+              if [ "$ns" != "mock" ]; then
+                namespaces+=("$ns")
+              fi
+            fi
+          done
+
+          if [ ${#namespaces[@]} -gt 0 ]; then
+            echo "namespaces=$(jq -c -n '$ARGS.positional' --args "${namespaces[@]}")" >> $GITHUB_OUTPUT
+            echo "deploy_flags=true" >> $GITHUB_OUTPUT
+            echo "Flag changes detected for: ${namespaces[*]}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "namespaces=[]" >> $GITHUB_OUTPUT
+            echo "deploy_flags=false" >> $GITHUB_OUTPUT
+          fi
+
+  deploy-flags:
+    name: Deploy flags → ${{ matrix.namespace }}
+    needs: detect-changes
+    if: needs.detect-changes.outputs.deploy_flags == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1   # Same as Ember — avoid race conditions
+      matrix:
+        namespace: ${{ fromJson(needs.detect-changes.outputs.namespaces) }}
+    environment: ${{ matrix.namespace == 'staging' && 'staging' || 'production' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: sensara-prod
+          location: europe-west4
+
+      - name: Build ConfigMap from feature flag JSON
+        run: |
+          NAMESPACE="${{ matrix.namespace }}"
+          FLAG_FILE="runtime-config/featureFlags/${NAMESPACE}.featureFlag.json"
+
+          if [ ! -f "$FLAG_FILE" ]; then
+            echo "No flag file for namespace $NAMESPACE — skipping"
+            exit 0
+          fi
+
+          # Convert JSON to individual ConfigMap data entries
+          # Spring Boot reads each key as a property via mounted volume
+          cat > /tmp/configmap-flags.yaml << EOF
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: feature-flags
+            namespace: ${NAMESPACE}
+            annotations:
+              sensara/version: "${{ needs.detect-changes.outputs.flag_version }}"
+              sensara/deployed-by: "${{ github.actor }}"
+              sensara/deployed-at: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          data:
+          $(cat "$FLAG_FILE" | jq -r 'to_entries[] | "  \(.key): \"\(.value)\""')
+          EOF
+
+          echo "ConfigMap contents:"
+          cat /tmp/configmap-flags.yaml
+
+      - name: Apply feature flags ConfigMap
+        run: |
+          # kubectl apply — no pod restart needed, Spring reads mounted volume
+          kubectl apply -f /tmp/configmap-flags.yaml
+
+          echo "## ✅ Feature flags deployed" >> $GITHUB_STEP_SUMMARY
+          echo "Namespace: **${{ matrix.namespace }}**" >> $GITHUB_STEP_SUMMARY
+          echo "Version: \`${{ needs.detect-changes.outputs.flag_version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "No pod restart required — Spring Boot reads ConfigMap volume on next evaluation." >> $GITHUB_STEP_SUMMARY
